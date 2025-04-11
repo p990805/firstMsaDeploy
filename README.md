@@ -566,3 +566,399 @@ Docer pipeline
 
 - 설치 후 재시작
 </details>
+
+<details>
+  <summary>2025-04-11</summary>
+
+# 1. 젠킨스?? 빌드 트리거 설정?
+
+- 젠킨스 API_TOKEN
+
+```docker
+curl -X POST "http://j12c202.p.ssafy.io:8080/job/j12c202-pipeline/build" \
+     --user USERNAME:YOUR_API_TOKEN
+```
+
+```docker
+
+curl -X POST "http://j12c202.p.ssafy.io:8080/job/j12c202-pipeline/build" --user
+```
+
+- 201이나 302 뜨면 잘된거
+
+# 2. Docker-compose-monitoring.yml
+
+```docker
+version: '3'
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    restart: unless-stopped
+    networks:
+      - monitoring-network
+      - backend-network
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    ports:
+      - "9100:9100"
+    restart: unless-stopped
+    networks:
+      - monitoring-network
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cadvisor
+    ports:
+      - "8082:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    restart: unless-stopped
+    networks:
+      - monitoring-network
+  loki:
+    image: grafana/loki:2.8.0
+    container_name: loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/local-config.yaml
+      - ./loki/tmp:/tmp/loki
+      - ./loki/wal:/wal
+    command: -config.file=/etc/loki/local-config.yaml
+    restart: unless-stopped
+    networks:
+      - monitoring-network
+  promtail:
+    image: grafana/promtail:2.8.0
+    container_name: promtail
+    volumes:
+      - ./promtail/promtail-config.yml:/etc/promtail/config.yml
+      - /var/log:/var/log
+    command: -config.file=/etc/promtail/config.yml
+    restart: unless-stopped
+    networks:
+      - monitoring-network
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123  # 실제 환경에서는 보안을 위해 변경하세요
+      - GF_USERS_ALLOW_SIGN_UP=false
+    restart: unless-stopped
+    networks:
+      - monitoring-network
+      - backend-network  # 기존 백엔드 네트워크와 연결
+      - frontend-network  # 기존 프론트엔드 네트워크와 연결
+volumes:
+  prometheus_data:
+  grafana_data:
+networks:
+  monitoring-network:
+    driver: bridge
+  backend-network:
+    external: true
+    name: ubuntu_backend-network  # 실제 Docker 네트워크 이름으로 수정
+  frontend-network:
+    external: true
+    name: ubuntu_frontend-network  # 실제 Docker 네트워크 이름으로 수정
+
+```
+
+# 3. /home/ubuntu/ 루트로 모니터링 폴더 만들기
+
+```docker
+mkdir -p /home/ubuntu/prometheus
+mkdir -p /home/ubuntu/loki
+mkdir -p /home/ubuntu/promtail
+mkdir -p /home/ubuntu/grafana/provisioning/datasources
+mkdir -p /home/ubuntu/grafana/provisioning/dashboards
+```
+
+# 4. prometheus 경로에서 prometheus.yml 생성
+
+```docker
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+
+  - job_name: 'spring-boot-apps'
+    metrics_path: '/actuator/prometheus'
+    scrape_interval: 5s
+    eureka_sd_configs:
+      - server: http://eureka-service:8761/eureka
+    relabel_configs:
+      - source_labels: [__meta_eureka_app_name]
+        action: keep
+        regex: 'CONFIG-SERVICE|EUREKA-SERVICE|GATEWAY-SERVICE'
+      - source_labels: [__meta_eureka_app_instance_id]
+        target_label: instance_id
+
+```
+
+# 5. loki경로에서 loki-config.yml 생성
+
+```docker
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+
+ingester:
+  lifecycler:
+    address: 127.0.0.1
+    ring:
+      kvstore:
+        store: inmemory
+      replication_factor: 1
+  chunk_idle_period: 5m
+  wal:
+    enabled: true
+    dir: "/wal"
+
+schema_config:
+  configs:
+    - from: 2020-05-15
+      store: boltdb-shipper
+      object_store: filesystem
+      schema: v11
+      index:
+        prefix: index_
+        period: 24h
+
+storage_config:
+  boltdb_shipper:
+    active_index_directory: /tmp/loki/index
+    cache_location: /tmp/loki/cache
+    shared_store: filesystem
+  filesystem:
+    directory: /tmp/loki/chunks
+
+compactor:
+  working_directory: /tmp/loki/compactor
+
+```
+
+# 6. Promtail 경로에서 promtail-config.yml 생성
+
+```docker
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: system
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: varlogs
+          __path__: /var/log/*log
+  - job_name: containers
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: containerlogs
+          __path__: /var/lib/docker/containers/*/*log
+
+```
+
+# 7. Grafana 데이터 소스 설정
+
+- ./grafana/provisioning/datasources/datasources.yml
+
+```docker
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    version: 1
+    editable: true
+
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    version: 1
+    editable: true
+
+```
+
+# 8. Grafana 대시보드 설정
+
+```docker
+apiVersion: 1
+
+providers:
+  - name: 'Default'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    editable: true
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+
+```
+
+# 9. 파일 권한 주기
+
+```docker
+chmod -R 755 /home/ubuntu/prometheus /home/ubuntu/loki /home/ubuntu/promtail /home/ubuntu/grafana
+```
+
+# 10. 백엔드 application.properties에서 추가 설정
+
+- config-service에서 몰려있는 곳에 추가 근데 나는 이렇게 추가함
+
+```docker
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+  endpoint:
+    prometheus:
+      enabled: true
+    health:
+      show-details: always
+```
+
+```docker
+management:
+  endpoints:
+    web:
+      exposure:
+        include: ${MANAGEMENT_ENDPOINTS_INCLUDE}
+  metrics:
+    export:
+      prometheus:
+        enabled: ${PROMETHEUS_ENABLED}
+  endpoint:
+    prometheus:
+      enabled: ${PROMETHEUS_ENDPOINT_ENABLED:true}
+    health:
+      show-details: ${HEALTH_DETAILS}
+
+```
+
+# 11. UFW 방화벽 설정해주기
+
+```docker
+# Prometheus UI 접근 허용
+sudo ufw allow 9090/tcp
+
+# Node Exporter 접근 허용
+sudo ufw allow 9100/tcp
+
+# cAdvisor 접근 허용
+sudo ufw allow 8082/tcp
+
+# Loki 접근 허용
+sudo ufw allow 3100/tcp
+
+# Grafana UI 접근 허용
+sudo ufw allow 3000/tcp
+```
+
+# 12. pom.xml 에 프로메테우스 의존성 추가
+
+- 모든 서비스 다 넣긴했음
+
+```docker
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-actuator</artifactId>
+</dependency>
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+```
+
+# 13. 모니터링 스택 실행하기
+
+```docker
+docker-compose -f docker-compose-monitoring.yml up -d
+docker ps | grep 'prometheus\|grafana\|loki\|promtail\|cadvisor\|node-exporter'
+
+```
+
+**Loki가 오류가 난다면?**
+
+```docker
+# Loki 임시 디렉토리 생성
+mkdir -p /home/ubuntu/loki/tmp/loki/index
+mkdir -p /home/ubuntu/loki/tmp/loki/cache
+mkdir -p /home/ubuntu/loki/tmp/loki/chunks
+mkdir -p /home/ubuntu/loki/tmp/loki/compactor
+
+# 권한 설정
+chmod -R 777 /home/ubuntu/loki/tmp
+
+# WAL 디렉토리 생성
+mkdir -p /home/ubuntu/loki/wal
+
+# 모든 사용자에게 쓰기 권한 부여
+chmod -R 777 /home/ubuntu/loki/wal
+
+# 디렉토리 권한 확인
+ls -la /home/ubuntu/loki/tmp
+
+# 권한 수정
+sudo chmod -R 777 /home/ubuntu/loki/tmp
+
+sudo chown -R loki:loki /tmp/loki
+sudo chmod -R 755 /tmp/loki
+```
+
+</details>
